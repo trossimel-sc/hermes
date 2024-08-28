@@ -142,7 +142,7 @@ class ES6ClassesTransformations
 
   ES6ClassesTransformations(Context &context)
       : context_(context),
-        identVar_(context.getIdentifier("var").getUnderlyingPointer()) {}
+        identVar_(context.getIdentifier("let").getUnderlyingPointer()) {}
 
   void visit(ESTree::ClassDeclarationNode *classDecl, ESTree::Node **ppNode) {
     auto *classBody = llvh::dyn_cast<ESTree::ClassBodyNode>(classDecl->_body);
@@ -153,7 +153,7 @@ class ES6ClassesTransformations
     auto *expressionResult = createClass(
         classDecl, classDecl->_id, classBody, classDecl->_superClass);
 
-    auto result = makeSingleVariableDecl(
+    auto result = makeSingleLetDecl(
         expressionResult, copyIdentifier(classDecl->_id), expressionResult);
 
     *ppNode = result;
@@ -317,7 +317,7 @@ class ES6ClassesTransformations
     if (superClass != nullptr) {
       superClassExpr = makeIdentifierNode(nullptr, "__super__");
       currentProcessingSuperClass = superClassExpr;
-      statements.append(makeSingleVariableDecl(
+      statements.append(makeSingleLetDecl(
           superClass, cloneNode(superClassExpr), cloneNode(superClass)));
       superClassExpr = cloneNode(superClass);
     } else {
@@ -362,7 +362,7 @@ class ES6ClassesTransformations
         identifer, typedIdentifier->_name, nullptr, false);
   }
 
-  ESTree::Node *makeSingleVariableDecl(
+  ESTree::Node *makeSingleLetDecl(
       ESTree::Node *srcNode,
       ESTree::Node *identifier,
       ESTree::Node *value) {
