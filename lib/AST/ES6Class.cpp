@@ -142,9 +142,18 @@ class ES6ClassesTransformations
 
   ES6ClassesTransformations(Context &context)
       : context_(context),
-        identVar_(context.getIdentifier("let").getUnderlyingPointer()) {}
+        identVar_(context.getIdentifier("let").getUnderlyingPointer()),
+        internalThis(context.getIdentifier("__hermes_internal_this__")
+            .getUnderlyingPointer()) {}
+
+  // when true, recursively replace ThisExpressionNode with
+  // __hermes_internal_this__
+  bool replaceThis = false;
 
   void visit(ESTree::ClassDeclarationNode *classDecl, ESTree::Node **ppNode) {
+    auto oldReplaceThis = replaceThis;
+    replaceThis = false;
+
     auto *classBody = llvh::dyn_cast<ESTree::ClassBodyNode>(classDecl->_body);
     if (classBody == nullptr) {
       return doVisitChildren(classDecl);
@@ -157,9 +166,13 @@ class ES6ClassesTransformations
         expressionResult, copyIdentifier(classDecl->_id), expressionResult);
 
     *ppNode = result;
+    replaceThis = oldReplaceThis;
   }
 
   void visit(ESTree::ClassExpressionNode *classExpr, ESTree::Node **ppNode) {
+    bool oldReplaceThis = replaceThis;
+    replaceThis = false;
+
     auto *classBody = llvh::dyn_cast<ESTree::ClassBodyNode>(classExpr->_body);
     if (classBody == nullptr) {
       return doVisitChildren(classExpr);
@@ -167,6 +180,7 @@ class ES6ClassesTransformations
 
     *ppNode = createClass(
         classExpr, classExpr->_id, classBody, classExpr->_superClass);
+    replaceThis = oldReplaceThis;
   }
 
   /// Visits call expressions nodes to convert super ctor invocations like
@@ -185,6 +199,7 @@ class ES6ClassesTransformations
       _currentProcessingClass->superCallFound = true;
       *ppNode = createSuperCall(
           callExpression,
+          makeIdentifierNode(callExpression, topClass->className),
           topClass->parentClass,
           NodeVector(callExpression->_arguments));
       return;
@@ -227,6 +242,21 @@ class ES6ClassesTransformations
         memberExpression, topClass->parentClass, memberExpression->_property);
   }
 
+  void visit(ESTree::ThisExpressionNode *classDecl, ESTree::Node **ppNode) {
+    if (replaceThis) {
+      *ppNode = makeIdentifierNode(classDecl, internalThis);
+    }
+  }
+
+  template <typename T>
+  typename std::enable_if<
+      std::is_same<T, ESTree::FunctionExpressionNode>::value ||
+      std::is_same<T, ESTree::FunctionDeclarationNode>::value>::type
+  visit(T *node, ESTree::Node **ppNode) {
+    // When entering a function, we have a different "this"
+    replaceThisCalls(node, false);
+  }
+
   void visit(ESTree::Node *node) {
     visitESTreeChildren(*this, node);
   }
@@ -239,6 +269,7 @@ class ES6ClassesTransformations
  private:
   Context &context_;
   UniqueString *const identVar_;
+  UniqueString *const internalThis;
   VisitedClass *_currentProcessingClass = nullptr;
   const ResolvedClassMember *_currentClassMember = nullptr;
 
@@ -425,10 +456,37 @@ class ES6ClassesTransformations
 
   ESTree::Node *createSuperCall(
       ESTree::Node *srcNode,
+      ESTree::Node *baseClass,
       ESTree::Node *superClass,
       NodeVector parameters) {
-    return createCallWithForwardedThis(
-        srcNode, cloneNode(superClass), std::move(parameters));
+    // We need to use Reflect.construct (or new) to call the super constructor,
+    // as calling super.apply(this, ...args) or super.apply(this, ...args) may
+    // not always return the class instance. For example, Date.call(this)
+    // returns a string and modifies "this", while Array.call(this) does not
+    // modify "this" but returns a new array.
+
+    auto *parametersArray = createTransformedNode<ESTree::ArrayExpressionNode>(
+        srcNode, parameters.toNodeList(), false);
+
+    auto *getPropertyNode = createTransformedNode<ESTree::MemberExpressionNode>(
+        srcNode,
+        makeIdentifierNode(srcNode, "Reflect"),
+        makeIdentifierNode(srcNode, "construct"),
+        false);
+    auto *callExpr = createTransformedNode<ESTree::CallExpressionNode>(
+        srcNode,
+        getPropertyNode,
+        nullptr,
+        NodeVector{makeIdentifierNode(superClass, "__super__"), parametersArray, cloneNode(baseClass)}.toNodeList());
+
+    auto *assignmentExpression =
+        createTransformedNode<ESTree::AssignmentExpressionNode>(
+            srcNode,
+            context_.getStringTable().getString("="),
+            makeIdentifierNode(srcNode, internalThis),
+            callExpr);
+
+    return assignmentExpression;
   }
 
   ESTree::Node *createGetSuperProperty(
@@ -444,13 +502,13 @@ class ES6ClassesTransformations
     ESTree::NodeList parameters;
     if (_currentClassMember && _currentClassMember->isStatic) {
       // Reflect.get(ParentClass, 'property', this);
-      parameters.push_back(*cloneNode(superClass));
+      parameters.push_back(*makeIdentifierNode(superClass, "__super__"));
     } else {
       // Reflect.get(ParentClass.prototype, 'property', this);
       auto *getParentClassPrototype =
           createTransformedNode<ESTree::MemberExpressionNode>(
               srcNode,
-              cloneNode(superClass),
+              makeIdentifierNode(superClass, "__super__"),
               makeIdentifierNode(srcNode, "prototype"),
               false);
       parameters.push_back(*getParentClassPrototype);
@@ -478,7 +536,7 @@ class ES6ClassesTransformations
     if (_currentClassMember && _currentClassMember->isStatic) {
       // Convert super.method(...args) calls to ParentClass.method.call(this,
       // ...args);
-      getMethodNodeParameter = cloneNode(superClass);
+      getMethodNodeParameter = makeIdentifierNode(superClass, "__super__");
     } else {
       // Convert super.method(...args) calls to
       // ParentClass.prototype.method.call(this, ...args);
@@ -486,7 +544,7 @@ class ES6ClassesTransformations
 
       getMethodNodeParameter =
           createTransformedNode<ESTree::MemberExpressionNode>(
-              srcNode, cloneNode(superClass), prototypeIdentifier, false);
+              srcNode, makeIdentifierNode(superClass, "__super__"), prototypeIdentifier, false);
     }
 
     auto *getMethodNode = createTransformedNode<ESTree::MemberExpressionNode>(
@@ -559,6 +617,50 @@ class ES6ClassesTransformations
     ESTree::NodeList paramList;
     ESTree::NodeList ctorStatements;
 
+    auto isDerived = superClass != nullptr;
+    if (isDerived) {
+      // var __hermes_internal_this__ = new __super__();
+      ESTree::Node *newSuperExpr;
+      newSuperExpr = createTransformedNode<ESTree::NewExpressionNode>(
+          superClass, makeIdentifierNode(superClass, "__super__"), nullptr, ESTree::NodeList());
+      auto *thisVarDecl = makeSingleLetDecl(
+          superClass,
+          makeIdentifierNode(superClass, internalThis),
+          newSuperExpr);
+      ctorStatements.push_back(*thisVarDecl);
+
+      // Object.setPrototypeOf(__hermes_internal_this__, MyClass.prototype);
+      auto *objectIdentifier = makeIdentifierNode(superClass, "Object");
+      auto *setPrototypeOfIdentifier =
+          makeIdentifierNode(superClass, "setPrototypeOf");
+
+      auto *setPrototypeOfMethod =
+          createTransformedNode<ESTree::MemberExpressionNode>(
+              superClass, objectIdentifier, setPrototypeOfIdentifier, false);
+
+      auto *thisExpression = makeIdentifierNode(superClass, internalThis);
+
+      auto *classPrototype =
+          createTransformedNode<ESTree::MemberExpressionNode>(
+              superClass,
+              cloneNode(identifier),
+              makeIdentifierNode(superClass, "prototype"),
+              false);
+
+      ESTree::NodeList setPrototypeOfArgs;
+      setPrototypeOfArgs.push_back(*thisExpression);
+      setPrototypeOfArgs.push_back(*classPrototype);
+
+      auto *setPrototypeOfCall =
+          createTransformedNode<ESTree::CallExpressionNode>(
+              superClass,
+              setPrototypeOfMethod,
+              nullptr,
+              std::move(setPrototypeOfArgs));
+
+      ctorStatements.push_back(*toStatement(setPrototypeOfCall));
+    }
+
     if (existingCtor != nullptr) {
       auto *ctorExpression =
           llvh::dyn_cast<ESTree::FunctionExpressionNode>(existingCtor->_value);
@@ -572,7 +674,7 @@ class ES6ClassesTransformations
       }
       auto addedPropertyInitializers = false;
 
-      if (superClass == nullptr) {
+      if (!isDerived) {
         // Append property initializers at beginning if no super class
         addedPropertyInitializers = true;
         appendPropertyInitializers(classBody, ctorStatements);
@@ -592,22 +694,33 @@ class ES6ClassesTransformations
       }
     } else {
       // No existing ctor.
-      if (superClass != nullptr) {
+      if (isDerived) {
         // Generate call to super()
         auto *argumentsSpread =
             createTransformedNode<ESTree::SpreadElementNode>(
                 superClass, makeIdentifierNode(superClass, "arguments"));
         auto *superCall = createSuperCall(
-            classBody, cloneNode(superClass), {argumentsSpread});
-        ctorStatements.push_back(*superCall);
+            classBody,
+            cloneNode(identifier),
+            cloneNode(superClass),
+            {argumentsSpread});
+        ctorStatements.push_back(*toStatement(superCall));
       }
 
       // Append initializers of class properties
       appendPropertyInitializers(classBody, ctorStatements);
     }
 
+    if (isDerived) {
+      auto *returnThisNode = createTransformedNode<ESTree::ReturnStatementNode>(
+          classBody, makeIdentifierNode(classBody, internalThis));
+      ctorStatements.push_back(*returnThisNode);
+    }
+
     auto *body = createTransformedNode<ESTree::BlockStatementNode>(
         classBody, std::move(ctorStatements));
+
+    replaceThisCalls(body, isDerived);
 
     return createTransformedNode<ESTree::FunctionDeclarationNode>(
         classBody,
@@ -771,6 +884,13 @@ class ES6ClassesTransformations
     }
     auto *callee = ESTree::getCallee(call);
     return callee->getKind() == ESTree::NodeKind::Super;
+  }
+
+  void replaceThisCalls(ESTree::Node *node, bool newReplaceThis) {
+    auto oldReplaceThis = replaceThis;
+    replaceThis = newReplaceThis;
+    visit(node);
+    replaceThis = oldReplaceThis;
   }
 };
 
