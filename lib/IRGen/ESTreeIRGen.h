@@ -559,6 +559,7 @@ class ESTreeIRGen {
   void genForOfFastArrayStatement(
       ESTree::ForOfStatementNode *forOfStmt,
       flow::ArrayType *type);
+  void genAsyncForOfStatement(ESTree::ForOfStatementNode *forOfStmt);
   void genWhileLoop(ESTree::WhileStatementNode *loop);
   void genDoWhileLoop(ESTree::DoWhileStatementNode *loop);
 
@@ -1210,6 +1211,9 @@ class ESTreeIRGen {
   /// \return the internal value @@iterator
   Value *emitIteratorSymbol();
 
+  /// \return the internal value @@asyncIterator
+  Value *emitAsyncIteratorSymbol();
+
   /// IteratorRecord as defined in ES2018 7.4.1 GetIterator
   struct IteratorRecordSlow {
     Value *iterator;
@@ -1227,6 +1231,7 @@ class ESTreeIRGen {
   ///
   /// \return (iterator, nextMethod)
   IteratorRecordSlow emitGetIteratorSlow(Value *obj);
+  IteratorRecordSlow emitGetAsyncIteratorSlow(Value *obj);
 
   /// ES2018 7.4.2 IteratorNext
   /// https://www.ecma-international.org/ecma-262/9.0/index.html#sec-iteratornext
